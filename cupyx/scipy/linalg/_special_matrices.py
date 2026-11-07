@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import warnings
 
+import numpy
+
 import cupy
 from cupy import _core
 from cupyx.scipy.linalg import _uarray
@@ -17,16 +19,18 @@ def toeplitz(c, r=None):
     assumed.
 
     Args:
-        c (cupy.ndarray): First column of the matrix. Whatever the actual shape
-            of ``c``, it will be converted to a 1-D array.
+        c (cupy.ndarray): First column of the matrix. If ``c`` has more than
+            one dimension, each slice along the last axis is the first column
+            of one matrix in a batch.
         r (cupy.ndarray, optional): First row of the matrix. If None,
             ``r = conjugate(c)`` is assumed; in this case, if ``c[0]`` is real,
             the result is a Hermitian matrix. r[0] is ignored; the first row of
-            the returned matrix is ``[c[0], r[1:]]``. Whatever the actual shape
-            of ``r``, it will be converted to a 1-D array.
+            the returned matrix is ``[c[0], r[1:]]``. The leading dimensions of
+            ``c`` and ``r`` are broadcast against each other.
 
     Returns:
-        cupy.ndarray: The Toeplitz matrix. Dtype is the same as
+        cupy.ndarray: The Toeplitz matrix, with shape
+        ``batch_shape + (c.shape[-1], r.shape[-1])``. Dtype is the same as
         ``(c[0] + r[0]).dtype``.
 
     .. seealso:: :func:`cupyx.scipy.linalg.circulant`
@@ -35,9 +39,10 @@ def toeplitz(c, r=None):
     .. seealso:: :func:`cupyx.scipy.linalg.fiedler`
     .. seealso:: :func:`scipy.linalg.toeplitz`
     """
-    c = c.ravel()
-    r = c.conjugate() if r is None else r.ravel()
-    return _create_toeplitz_matrix(c[::-1], r[1:])
+    c = cupy.atleast_1d(c)
+    r = c.conjugate() if r is None else cupy.atleast_1d(r)
+    c, r = _broadcast_batch(c, r)
+    return _create_toeplitz_matrix(c[..., ::-1], r[..., 1:])
 
 
 @_uarray.implements('circulant')
@@ -45,10 +50,13 @@ def circulant(c):
     """Construct a circulant matrix.
 
     Args:
-        c (cupy.ndarray): 1-D array, the first column of the matrix.
+        c (cupy.ndarray): The first column of the matrix. If ``c`` has more
+            than one dimension, each slice along the last axis is the first
+            column of one matrix in a batch.
 
     Returns:
-        cupy.ndarray: A circulant matrix whose first column is ``c``.
+        cupy.ndarray: A circulant matrix whose first column is ``c``, with
+        shape ``c.shape + (c.shape[-1],)``.
 
     .. seealso:: :func:`cupyx.scipy.linalg.toeplitz`
     .. seealso:: :func:`cupyx.scipy.linalg.hankel`
@@ -56,8 +64,8 @@ def circulant(c):
     .. seealso:: :func:`cupyx.scipy.linalg.fiedler`
     .. seealso:: :func:`scipy.linalg.circulant`
     """
-    c = c.ravel()
-    return _create_toeplitz_matrix(c[::-1], c[:0:-1])
+    c = cupy.atleast_1d(c)
+    return _create_toeplitz_matrix(c[..., ::-1], c[..., :0:-1])
 
 
 @_uarray.implements('hankel')
@@ -89,13 +97,20 @@ def hankel(c, r=None):
     return _create_toeplitz_matrix(c, r[1:], True)
 
 
+def _broadcast_batch(*arrays):
+    # Broadcast the leading (batch) dimensions; the last axis is the core one.
+    batch_shape = numpy.broadcast_shapes(*(a.shape[:-1] for a in arrays))
+    return [cupy.broadcast_to(a, batch_shape + a.shape[-1:]) for a in arrays]
+
+
 def _create_toeplitz_matrix(c, r, hankel=False):
-    vals = cupy.concatenate((c, r))
-    n = vals.strides[0]
-    return cupy.lib.stride_tricks.as_strided(
-        vals if hankel else vals[c.size-1:],
-        shape=(c.size, r.size+1),
-        strides=(n if hankel else -n, n)).copy()
+    # c and r share their leading dimensions. Element (i, j) of each matrix is
+    # vals[i + j] for a Hankel matrix and vals[m - 1 - i + j] otherwise.
+    vals = cupy.concatenate((c, r), axis=-1)
+    m, n = c.shape[-1], r.shape[-1] + 1
+    i = cupy.arange(m)[:, None]
+    j = cupy.arange(n)
+    return vals[..., i + j if hankel else m - 1 - i + j]
 
 
 @_uarray.implements('hadamard')
@@ -136,9 +151,10 @@ def leslie(f, s):
 
     Args:
         f (cupy.ndarray): The "fecundity" coefficients.
-        s (cupy.ndarray): The "survival" coefficients, has to be 1-D.  The
-            length of ``s`` must be one less than the length of ``f``, and it
-            must be at least 1.
+        s (cupy.ndarray): The "survival" coefficients. The length of ``s``
+            along the last axis must be one less than that of ``f``, and it
+            must be at least 1. The leading dimensions of ``f`` and ``s`` are
+            broadcast against each other, giving a batch of matrices.
 
     Returns:
         cupy.ndarray: The array is zero except for the first row, which is
@@ -147,18 +163,17 @@ def leslie(f, s):
 
     .. seealso:: :func:`scipy.linalg.leslie`
     """
-    if f.ndim != 1:
-        raise ValueError('Incorrect shape for f. f must be 1D')
-    if s.ndim != 1:
-        raise ValueError('Incorrect shape for s. s must be 1D')
-    n = f.size
-    if n != s.size + 1:
+    f = cupy.atleast_1d(f)
+    s = cupy.atleast_1d(s)
+    n = f.shape[-1]
+    if n != s.shape[-1] + 1:
         raise ValueError('Length of s must be one less than length of f')
-    if s.size == 0:
+    if s.shape[-1] == 0:
         raise ValueError('The length of s must be at least 1.')
-    a = cupy.zeros((n, n), dtype=cupy.result_type(f, s))
-    a[0] = f
-    cupy.fill_diagonal(a[1:], s)
+    f, s = _broadcast_batch(f, s)
+    a = cupy.zeros(f.shape[:-1] + (n, n), dtype=cupy.result_type(f, s))
+    a[..., 0, :] = f
+    a[..., cupy.arange(1, n), cupy.arange(n - 1)] = s
     return a
 
 
@@ -246,8 +261,10 @@ def companion(a):
     coefficients are given in ``a``.
 
     Args:
-        a (cupy.ndarray): 1-D array of polynomial coefficients. The length of
-            ``a`` must be at least two, and ``a[0]`` must not be zero.
+        a (cupy.ndarray): Polynomial coefficients. The length of ``a`` along
+            the last axis must be at least two, and ``a[..., 0]`` must not be
+            zero. If ``a`` has more than one dimension, each slice along the
+            last axis gives one matrix in a batch.
 
     Returns:
         (cupy.ndarray): The first row of the output is ``-a[1:]/a[0]``, and the
@@ -257,19 +274,18 @@ def companion(a):
     .. seealso:: :func:`cupyx.scipy.linalg.fiedler_companion`
     .. seealso:: :func:`scipy.linalg.companion`
     """
-    n = a.size
-    if a.ndim != 1:
-        raise ValueError('`a` must be one-dimensional.')
+    a = cupy.atleast_1d(a)
+    n = a.shape[-1]
     if n < 2:
         raise ValueError('The length of `a` must be at least 2.')
     # Following check requires device-to-host synchronization so will we not
     # raise an error this situation
     # if a[0] == 0:
     #     raise ValueError('The first coefficient in `a` must not be zero.')
-    first_row = -a[1:] / a[0]
-    c = cupy.zeros((n - 1, n - 1), dtype=first_row.dtype)
-    c[0] = first_row
-    cupy.fill_diagonal(c[1:], 1)
+    first_row = -a[..., 1:] / a[..., :1]
+    c = cupy.zeros(a.shape[:-1] + (n - 1, n - 1), dtype=first_row.dtype)
+    c[..., 0, :] = first_row
+    c[..., cupy.arange(1, n - 1), cupy.arange(n - 2)] = 1
     return c
 
 
@@ -376,23 +392,26 @@ def fiedler(a):
     the inverse and the determinant can be derived explicitly.
 
     Args:
-        a (cupy.ndarray): coefficient array
+        a (cupy.ndarray): coefficient array. If ``a`` has more than one
+            dimension, each slice along the last axis gives one matrix in a
+            batch.
 
     Returns:
-        cupy.ndarray: the symmetric Fiedler matrix
+        cupy.ndarray: the symmetric Fiedler matrix, with shape
+        ``a.shape + (a.shape[-1],)``
 
     .. seealso:: :func:`cupyx.scipy.linalg.circulant`
     .. seealso:: :func:`cupyx.scipy.linalg.toeplitz`
     .. seealso:: :func:`scipy.linalg.fiedler`
     """
-    if a.ndim != 1:
-        raise ValueError('Input `a` must be a 1D array.')
-    if a.size == 0:
-        return cupy.zeros((0, 0))
-    if a.size == 1:
+    a = cupy.atleast_1d(a)
+    if a.shape[-1] == 0:
+        return cupy.zeros(a.shape[:-1] + (0, 0))
+    if a.ndim == 1 and a.size == 1:
         return cupy.zeros((1, 1))
-    a = a[:, None] - a
-    return cupy.abs(a, out=a)
+    a = a[..., :, None] - a[..., None, :]
+    # The absolute value of a complex difference is real.
+    return cupy.abs(a) if a.dtype.kind == 'c' else cupy.abs(a, out=a)
 
 
 @_uarray.implements('fiedler_companion')
@@ -404,10 +423,11 @@ def fiedler_companion(a):
     with the roots of ``a``.
 
     Args:
-        a (cupy.ndarray): 1-D array of polynomial coefficients in descending
-            order with a nonzero leading coefficient. For ``N == 1`` an empty
-            ``(0, 0)`` array is returned, and for ``N == 0`` an empty 1-D
-            array.
+        a (cupy.ndarray): Polynomial coefficients in descending order with a
+            nonzero leading coefficient. For ``N == 1`` an empty ``(0, 0)``
+            array is returned, and for ``N == 0`` an empty 1-D array. If ``a``
+            has more than one dimension, each slice along the last axis gives
+            one matrix in a batch.
 
     Returns:
         cupy.ndarray: Resulting companion matrix
@@ -421,29 +441,39 @@ def fiedler_companion(a):
     .. seealso:: :func:`cupyx.scipy.linalg.companion`
     .. seealso:: :func:`scipy.linalg.fiedler_companion`
     """
-    if a.ndim != 1:
-        raise ValueError('Input `a` must be a 1-D array.')
-    if a.size == 0:
-        return cupy.zeros((0,), a.dtype)
-    if a.size == 1:
-        return cupy.zeros((0, 0), a.dtype)
-    if a.size == 2:
-        return (-a[1]/a[0])[None, None]
+    a = cupy.atleast_1d(a)
+    batch_shape, size = a.shape[:-1], a.shape[-1]
+    if size == 0:
+        return cupy.zeros(batch_shape + (0,), a.dtype)
+    if size == 1:
+        return cupy.zeros(batch_shape + (0, 0), a.dtype)
+    if size == 2:
+        return (-a[..., 1]/a[..., 0])[..., None, None]
     # Following check requires device-to-host synchronization so will we not
     # raise an error this situation
     # if a[0] == 0.:
     #     raise ValueError('Leading coefficient is zero.')
-    a = a/a[0]
-    n = a.size - 1
-    c = cupy.zeros((n, n), dtype=a.dtype)
+    a = a/a[..., :1]
+    n = size - 1
+    c = cupy.zeros(batch_shape + (n, n), dtype=a.dtype)
+
+    def diagonal(rows, cols):
+        # The first k elements of the diagonal of c[rows, cols], where k is
+        # the length of the shorter of the two ranges.
+        rows, cols = numpy.arange(n)[rows], numpy.arange(n)[cols]
+        k = min(rows.size, cols.size)
+        return cupy.asarray(rows[:k]), cupy.asarray(cols[:k])
+
     # subdiagonals
-    cupy.fill_diagonal(c[3::2, 1::2], 1)
-    cupy.fill_diagonal(c[2::2, 1::2], -a[3::2])
+    c[(...,) + diagonal(slice(3, None, 2), slice(1, None, 2))] = 1
+    rows, cols = diagonal(slice(2, None, 2), slice(1, None, 2))
+    c[..., rows, cols] = -a[..., 3::2][..., :rows.size]
     # superdiagonals
-    cupy.fill_diagonal(c[::2, 2::2], 1)
-    cupy.fill_diagonal(c[::2, 1::2], -a[2::2])
-    c[0, 0] = -a[1]
-    c[1, 0] = 1
+    c[(...,) + diagonal(slice(None, None, 2), slice(2, None, 2))] = 1
+    rows, cols = diagonal(slice(None, None, 2), slice(1, None, 2))
+    c[..., rows, cols] = -a[..., 2::2][..., :rows.size]
+    c[..., 0, 0] = -a[..., 1]
+    c[..., 1, 0] = 1
     return c
 
 
@@ -454,7 +484,9 @@ def convolution_matrix(a, n, mode='full'):
     Constructs the Toeplitz matrix representing one-dimensional convolution.
 
     Args:
-        a (cupy.ndarray): The 1-D array to convolve.
+        a (cupy.ndarray): The array to convolve. If ``a`` has more than one
+            dimension, each slice along the last axis gives one matrix in a
+            batch.
         n (int): The number of columns in the resulting matrix. It gives the
             length of the input to be convolved with ``a``. This is analogous
             to the length of ``v`` in ``numpy.convolve(a, v)``.
@@ -478,9 +510,7 @@ def convolution_matrix(a, n, mode='full'):
     """
     if n <= 0:
         raise ValueError('n must be a positive integer.')
-    if a.ndim != 1:
-        raise ValueError('convolution_matrix expects a one-dimensional '
-                         'array as input')
+    a = cupy.atleast_1d(a)
     if a.size == 0:
         raise ValueError('len(a) must be at least 1.')
     if mode not in ('full', 'valid', 'same'):
@@ -488,20 +518,22 @@ def convolution_matrix(a, n, mode='full'):
             '`mode` argument must be one of (\'full\', \'valid\', \'same\')')
 
     # create zero padded versions of the array
-    az = cupy.pad(a, (0, n-1), 'constant')
-    raz = cupy.pad(a[::-1], (0, n-1), 'constant')
+    pad_width = [(0, 0)] * (a.ndim - 1) + [(0, n-1)]
+    az = cupy.pad(a, pad_width, 'constant')
+    raz = cupy.pad(a[..., ::-1], pad_width, 'constant')
+    m, padded = a.shape[-1], az.shape[-1]
     if mode == 'same':
-        trim = min(n, a.size) - 1
+        trim = min(n, m) - 1
         tb = trim//2
         te = trim - tb
-        col0 = az[tb:az.size-te]
-        row0 = raz[-n-tb:raz.size-tb]
+        col0 = az[..., tb:padded-te]
+        row0 = raz[..., -n-tb:padded-tb]
     elif mode == 'valid':
-        tb = min(n, a.size) - 1
+        tb = min(n, m) - 1
         te = tb
-        col0 = az[tb:az.size-te]
-        row0 = raz[-n-tb:raz.size-tb]
+        col0 = az[..., tb:padded-te]
+        row0 = raz[..., -n-tb:padded-tb]
     else:  # 'full'
         col0 = az
-        row0 = raz[-n:]
+        row0 = raz[..., -n:]
     return toeplitz(col0, row0)

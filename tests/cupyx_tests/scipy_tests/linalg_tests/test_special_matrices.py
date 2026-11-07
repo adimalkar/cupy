@@ -141,3 +141,66 @@ class TestSpecialMatrices_1_5_0(TestSpecialMatricesBase):
     def test_special_matrix(self, xp, scp):
         function = getattr(scp.linalg, self.function)
         return function(*[self._get_arg(xp, arg) for arg in self.args])
+
+
+@testing.with_requires('scipy>=1.15')
+class TestSpecialMatricesBatch:
+    # SciPy treats N-D input as a batch: each slice along the last axis gives
+    # one matrix.
+
+    @pytest.mark.parametrize('batch', [(3,), (2, 3), (2, 1, 3)])
+    @pytest.mark.parametrize(('function', 'shapes'), [
+        ('circulant', [(5,)]),
+        ('companion', [(5,)]),
+        ('fiedler', [(5,)]),
+        ('fiedler_companion', [(2,)]),
+        ('fiedler_companion', [(6,)]),
+        ('fiedler_companion', [(7,)]),
+        ('leslie', [(5,), (4,)]),
+    ])
+    @testing.numpy_cupy_allclose(atol=1e-5, rtol=1e-5, scipy_name='scp')
+    def test_batch(self, xp, scp, function, shapes, batch):
+        args = [testing.shaped_random(batch + shape, xp, scale=5, seed=i)
+                for i, shape in enumerate(shapes)]
+        return getattr(scp.linalg, function)(*args)
+
+    @testing.numpy_cupy_allclose(atol=1e-5, rtol=1e-5, scipy_name='scp')
+    def test_leslie_broadcast(self, xp, scp):
+        f = testing.shaped_random((2, 3, 5), xp, seed=0)
+        s = testing.shaped_random((4,), xp, seed=1)
+        return scp.linalg.leslie(f, s)
+
+    @pytest.mark.parametrize('mode', ['full', 'same', 'valid'])
+    @pytest.mark.parametrize('n', [2, 7])
+    @testing.numpy_cupy_allclose(atol=1e-5, rtol=1e-5, scipy_name='scp')
+    def test_convolution_matrix(self, xp, scp, n, mode):
+        a = testing.shaped_random((2, 3, 5), xp)
+        return scp.linalg.convolution_matrix(a, n, mode)
+
+    @testing.for_complex_dtypes()
+    @testing.numpy_cupy_allclose(atol=1e-5, rtol=1e-5, scipy_name='scp')
+    def test_fiedler_complex(self, xp, scp, dtype):
+        # The absolute value of a complex difference is real.
+        a = testing.shaped_random((2, 4), xp, dtype)
+        return scp.linalg.fiedler(a)
+
+
+@testing.with_requires('scipy>=1.17')
+class TestToeplitzBatch:
+    # SciPy 1.17 treats N-D input to `toeplitz` as a batch instead of
+    # flattening it.
+
+    @pytest.mark.parametrize(('c_shape', 'r_shape'), [
+        ((2, 3, 4), None),
+        ((2, 3, 4), (2, 3, 6)),
+        ((2, 3, 4), (6,)),
+        ((4,), (2, 3, 6)),
+        ((3, 1, 4), (1, 2, 5)),
+    ])
+    @testing.numpy_cupy_allclose(atol=1e-5, rtol=1e-5, scipy_name='scp')
+    def test_toeplitz(self, xp, scp, c_shape, r_shape):
+        c = testing.shaped_random(c_shape, xp, seed=0)
+        if r_shape is None:
+            return scp.linalg.toeplitz(c)
+        r = testing.shaped_random(r_shape, xp, seed=1)
+        return scp.linalg.toeplitz(c, r)
